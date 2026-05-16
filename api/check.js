@@ -32,11 +32,11 @@ export default async function handler(req, res) {
     const allErrors = [];
 
     for (const chunk of chunks) {
-      const pnuRes = await fetch('https://speller.cs.pusan.ac.kr/results', {
+      const pnuRes = await fetch('https://nara-speller.co.kr/speller/results', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
-          'Referer': 'https://speller.cs.pusan.ac.kr/',
+          'Referer': 'https://nara-speller.co.kr/',
           'User-Agent': 'Mozilla/5.0 (compatible; SpellitPlugin/1.0)',
         },
         body: 'text1=' + encodeURIComponent(chunk),
