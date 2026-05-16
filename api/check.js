@@ -1,112 +1,68 @@
 // api/check.js
-// Vercel Serverless Function — CORS proxy for PNU Korean spellchecker
-// Deployed on Vercel (free tier), called from Figma plugin UI
+// Vercel Serverless Function — Korean spell check via Google Gemini API
 
 export default async function handler(req, res) {
-  // Allow requests from Figma plugin (null origin) and any origin
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  // Preflight
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const { text } = req.body;
-
   if (!text || typeof text !== 'string') {
     return res.status(400).json({ error: 'text field is required' });
   }
 
-  // PNU spellchecker has a ~500 char limit per request
-  // Split into chunks if needed
-  const MAX_CHUNK = 400;
-  const chunks = splitIntoChunks(text, MAX_CHUNK);
+  const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+  if (!GEMINI_API_KEY) {
+    return res.status(500).json({ error: 'API key not configured' });
+  }
+
+  const prompt = `당신은 한국어 맞춤법 검사 전문가입니다.
+
+아래 텍스트의 맞춤법, 띄어쓰기, 철자 오류를 검사해주세요.
+
+규칙:
+- 한국어+영어 혼용은 오류가 아님 (예: "버튼 Click", "홈 Home")
+- 브랜드명, 고유명사, 2자 이하 단어, 약어는 검사 제외
+- 명백한 오류만 리포트 (불확실한 경우 제외)
+- 오류가 없으면 errors를 빈 배열로 반환
+
+검사할 텍스트:
+"${text.replace(/"/g, '\\"')}"
+
+반드시 아래 JSON 형식으로만 응답 (다른 텍스트 절대 금지, 마크다운 코드블록 금지):
+{"errors":[{"wrong":"틀린부분","suggestion":"올바른표현","desc":"오류설명","type":"spelling또는spacing또는grammar"}]}`;
 
   try {
-    const allErrors = [];
-
-    for (const chunk of chunks) {
-      const pnuRes = await fetch('https://nara-speller.co.kr/speller/results', {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+      {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Referer': 'https://nara-speller.co.kr/',
-          'User-Agent': 'Mozilla/5.0 (compatible; SpellitPlugin/1.0)',
-        },
-        body: 'text1=' + encodeURIComponent(chunk),
-        signal: AbortSignal.timeout(10000),
-      });
-
-      if (!pnuRes.ok) {
-        throw new Error('PNU API returned ' + pnuRes.status);
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0, maxOutputTokens: 1024 }
+        }),
+        signal: AbortSignal.timeout(15000)
       }
+    );
 
-      const data = await pnuRes.json();
-
-      if (data && Array.isArray(data.errInfo)) {
-        for (const e of data.errInfo) {
-          allErrors.push({
-            wrong: e.orgStr,
-            suggestion: e.candWord ? e.candWord.split('|')[0] : e.orgStr,
-            desc: e.help || '맞춤법 오류',
-            // errorIdx: 1=철자, 2=띄어쓰기, 3=문법, 4=표준어
-            type: e.errorIdx === 2 ? 'spacing' : e.errorIdx === 3 ? 'grammar' : 'spelling',
-          });
-        }
-      }
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error('Gemini error: ' + (err.error?.message || response.status));
     }
 
-    // Deduplicate by wrong word
-    const seen = new Set();
-    const unique = allErrors.filter(e => {
-      if (seen.has(e.wrong)) return false;
-      seen.add(e.wrong);
-      return true;
-    });
+    const data = await response.json();
+    const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '{"errors":[]}';
+    const clean = raw.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
+    const parsed = JSON.parse(clean);
 
-    return res.status(200).json({ errors: unique });
+    return res.status(200).json({ errors: parsed.errors || [] });
 
   } catch (err) {
-    console.error('PNU proxy error:', err);
-    return res.status(502).json({ error: 'Failed to reach PNU spellchecker: ' + err.message });
+    console.error('Gemini proxy error:', err);
+    return res.status(502).json({ error: err.message });
   }
-}
-
-function splitIntoChunks(text, maxLen) {
-  const chunks = [];
-  // Split on sentence boundaries first, then by length
-  const sentences = text.split(/(?<=[.!?\n])\s*/);
-  let current = '';
-
-  for (const sentence of sentences) {
-    if ((current + sentence).length > maxLen) {
-      if (current) chunks.push(current.trim());
-      // If single sentence is too long, split by spaces
-      if (sentence.length > maxLen) {
-        const words = sentence.split(' ');
-        let sub = '';
-        for (const word of words) {
-          if ((sub + ' ' + word).length > maxLen) {
-            if (sub) chunks.push(sub.trim());
-            sub = word;
-          } else {
-            sub = sub ? sub + ' ' + word : word;
-          }
-        }
-        if (sub) current = sub;
-      } else {
-        current = sentence;
-      }
-    } else {
-      current = current ? current + ' ' + sentence : sentence;
-    }
-  }
-  if (current.trim()) chunks.push(current.trim());
-  return chunks.filter(c => c.length > 0);
 }
